@@ -11,19 +11,58 @@ const pw = require('playwright');
 const queries = JSON.parse(process.env.QUERIES_JSON || '[]');
 const GAP_MS = 3000;
 
+// ENGINE SWITCH (2026-08-02): BROWSER=camoufox runs the batch on Camoufox (a
+// Firefox stealth fork with C++-level fingerprint spoofing) instead of WebKit.
+// The bet, proven on the RackNerd relay box the same day: Camoufox clears
+// Startpage on a raw datacenter IP that WebKit gets walled on. GitHub's Azure
+// runner IPs are exactly that kind of IP — WebKit walls them, so proxy-less
+// accounts (reefhaus) fall all the way back to DDG. If Camoufox clears the
+// Azure IP directly, those runs return real Google (Startpage) for $0 proxy
+// cost. Falls back to WebKit if camoufox-js isn't installed.
+const USE_CAMOUFOX = process.env.BROWSER === 'camoufox';
+let camoufoxLaunchOptions = null;
+if (USE_CAMOUFOX) {
+  try { camoufoxLaunchOptions = require('camoufox-js').launchOptions; }
+  catch { console.error('BROWSER=camoufox set but camoufox-js not installed — using WebKit'); }
+}
+async function launchBrowser(proxyOptions) {
+  if (USE_CAMOUFOX && camoufoxLaunchOptions) {
+    const opts = await camoufoxLaunchOptions({ headless: true, geoip: !!proxyOptions.proxy, ...(proxyOptions.proxy ? { proxy: proxyOptions.proxy } : {}) });
+    return pw.firefox.launch(opts);
+  }
+  return pw.webkit.launch({ headless: true, ...proxyOptions });
+}
+
+// Sticky exit per run (2026-08-02): the runner used a bare rotating proxy, so
+// every query got a fresh exit IP against one cold context — clearance never
+// held, the challenge re-walled, and this account's runs fell back to DDG far
+// more than the others (observed: reefhausstudio-prog came back ddg-heavy).
+// The relay-wk fleet fixed the identical problem by pinning ONE exit per boot
+// so clearance earned on the first query holds for the rest (~90% ok vs cold).
+// Pin one session for the whole run; the provider holds the IP up to 120 min.
+// Disable with STICKY=0. randomBytes avoids a session collision across the
+// parallel runs sharing the same proxy creds.
+const SESSION_ID = require('crypto').randomBytes(4).toString('hex');
+
 function proxyOpt() {
   const raw = String(process.env.PROXY_URL || '').trim();
   if (!raw) return {};
   try {
     const u = new URL(raw);
-    return { proxy: { server: `${u.protocol}//${u.host}`, username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) } };
+    let username = decodeURIComponent(u.username), password = decodeURIComponent(u.password);
+    if (process.env.STICKY !== '0') {
+      // Evomi pins via password params; DataImpulse via username suffix.
+      if (/evomi/i.test(u.hostname)) password += `_session-${SESSION_ID}_lifetime-120`;
+      else if (/dataimpulse/i.test(u.hostname)) username += `;sessid.${SESSION_ID};sessttl.120`;
+    }
+    return { proxy: { server: `${u.protocol}//${u.host}`, username, password } };
   } catch { return {}; }
 }
 
 let browser = null, ctx = null;
 async function getCtx() {
   if (ctx) return ctx;
-  browser = await pw.webkit.launch({ headless: true, ...proxyOpt() });
+  browser = await launchBrowser(proxyOpt());
   ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   // Lean mode (2026-07-31): runner traffic transits the residential proxy and
   // bills real GB. Abort heavy subresources AND every third-party host —
